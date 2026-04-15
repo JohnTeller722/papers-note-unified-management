@@ -9,14 +9,48 @@ const BASE_ENTRY_FIELDS = [
   ["venue", "会议/期刊", "text", false],
   ["authors", "作者", "text", false],
   ["link", "链接", "text", false],
+  ["pdfPath", "PDF路径", "text", false],
   ["mdPath", "MD路径", "text", false],
 ];
+
+const DEFAULT_AI_SYSTEM_PROMPT =
+  "你是严谨的论文阅读助手。只基于提供的论文信息作答，证据不足时返回空值，不要编造。输出必须是 JSON 对象。";
+const DEFAULT_AI_FIELD_PROMPT_TEMPLATE = [
+  "请基于以下上下文，为目标字段生成建议值。",
+  "目标字段: {{field_key}}",
+  "分析模式: {{mode}}",
+  "论文元数据(JSON): {{paper_json}}",
+  "笔记摘录: {{note_content}}",
+  "PDF全文摘录: {{pdf_excerpt}}",
+  "若证据不足，请返回空字符串。",
+  "仅返回 JSON: {\"value\":\"\",\"confidence\":0.0,\"rationale\":\"\"}",
+].join("\n");
+const DEFAULT_AI_BLOCKED_FIELD_KEYS = ["relation_type", "category"];
 
 const state = {
   templatesPayload: null,
   templatesById: new Map(),
   enums: {},
-  settings: { notesDir: "" },
+  settings: {
+    notesDir: "",
+    ai: {
+      enabled: false,
+      provider: "openai_compatible",
+      baseUrl: "https://api.openai.com/v1",
+      model: "gpt-4.1-mini",
+      timeoutMs: 30000,
+      pdfPolicy: "full_pdf",
+      systemPrompt: DEFAULT_AI_SYSTEM_PROMPT,
+      fieldPromptTemplate: DEFAULT_AI_FIELD_PROMPT_TEMPLATE,
+      blockedFieldKeys: [...DEFAULT_AI_BLOCKED_FIELD_KEYS],
+      requirePdf: true,
+    },
+  },
+  aiSession: {
+    id: "",
+    paperId: null,
+    updatedAt: 0,
+  },
   papers: [],
   selectedIds: new Set(),
   currentStage: "rough",
@@ -79,6 +113,39 @@ function showModal({ title, text, type = "success" }) {
   };
 }
 
+function askConfirm({ title, text, confirmText = "确认", cancelText = "取消", type = "primary" }) {
+  return new Promise((resolve) => {
+    const old = document.getElementById("globalModal");
+    if (old) old.remove();
+
+    const wrap = document.createElement("div");
+    wrap.id = "globalModal";
+    wrap.className = "modal-backdrop";
+    wrap.innerHTML = `
+      <div class="modal">
+        <h3>${escapeHtml(title)}</h3>
+        <div class="muted">${escapeHtml(text)}</div>
+        <div class="row" style="margin-top: 14px; justify-content:flex-end;">
+          <button class="btn" id="modalCancelBtn">${escapeHtml(cancelText)}</button>
+          <button class="btn ${escapeHtml(type)}" id="modalConfirmBtn">${escapeHtml(confirmText)}</button>
+        </div>
+      </div>
+    `;
+
+    const close = (accepted) => {
+      wrap.remove();
+      resolve(Boolean(accepted));
+    };
+
+    document.body.appendChild(wrap);
+    wrap.querySelector("#modalCancelBtn").onclick = () => close(false);
+    wrap.querySelector("#modalConfirmBtn").onclick = () => close(true);
+    wrap.onclick = (e) => {
+      if (e.target === wrap) close(false);
+    };
+  });
+}
+
 function currentStageTemplates() {
   if (!state.templatesPayload) return [];
   return state.currentStage === "deep" ? state.templatesPayload.deepTemplates : state.templatesPayload.roughTemplates;
@@ -114,6 +181,172 @@ function buildFieldInput(field, value = "") {
   return `<input data-field-key="${field.key}" value="${v}" placeholder="${escapeHtml(field.label)}" />`;
 }
 
+function collectAiTargetFieldKeys() {
+  const template = currentTemplate();
+  const blockedSet = new Set(state.settings.ai?.blockedFieldKeys || []);
+  return (template?.fields || []).map((field) => field.key).filter((key) => key && !blockedSet.has(key));
+}
+
+function isAiBlockedField(fieldKey) {
+  const blockedSet = new Set(state.settings.ai?.blockedFieldKeys || []);
+  return blockedSet.has(String(fieldKey || "").trim());
+}
+
+function resetAiSessionLocal() {
+  state.aiSession = { id: "", paperId: null, updatedAt: 0 };
+}
+
+async function ensureAiFullPdfConsentIfNeeded(paperId) {
+  const sameSession = state.aiSession.id && Number(state.aiSession.paperId) === Number(paperId);
+  if (sameSession) return true;
+  const accepted = await askConfirm({
+    title: "确认发送全文给 AI",
+    text: "你将把该论文全文发送给第三方 AI 服务。系统不会自动保存字段，请逐条确认后再保存。",
+    confirmText: "同意并继续",
+    cancelText: "取消",
+    type: "primary",
+  });
+  return accepted;
+}
+
+function normalizeAiSourceLabel(result) {
+  if (result?.warnings?.length) return `AI建议（含警告：${result.warnings.join("；")}）`;
+  return "AI建议";
+}
+
+async function runFieldAiSuggest({ paperId, fieldKey }) {
+  if (!paperId) throw new Error("请先保存记录后再调用 AI 建议");
+  if (!state.settings.ai?.enabled) throw new Error("请先到设置页启用 AI");
+  if (isAiBlockedField(fieldKey)) throw new Error("该字段已被策略设为人工填写，不支持自动补全");
+
+  const paper = getPaperById(Number(paperId));
+  if (state.settings.ai?.requirePdf && !paper?.pdfPath) {
+    throw new Error("当前策略要求先上传/绑定PDF，才能执行AI生成");
+  }
+
+  const consentOk = await ensureAiFullPdfConsentIfNeeded(paperId);
+  if (!consentOk) throw new Error("已取消 AI 分析");
+
+  const result = await api.aiSuggest({
+    paperId,
+    targetFieldKeys: [fieldKey],
+    mode: "combined",
+    pdfPolicy: state.settings.ai?.pdfPolicy || "full_pdf",
+    consent: { accepted: true },
+    aiSessionId:
+      state.aiSession.id && Number(state.aiSession.paperId) === Number(paperId)
+        ? state.aiSession.id
+        : "",
+  });
+
+  if (result?.aiSessionId) {
+    state.aiSession = { id: result.aiSessionId, paperId: Number(paperId), updatedAt: Date.now() };
+  }
+
+  return result;
+}
+
+async function applyFieldSuggestionWithConfirm({ fieldKey, suggestedValue }) {
+  const input = app.entryEl.querySelector(`[data-field-key="${fieldKey}"]`);
+  if (!input) throw new Error(`字段不存在: ${fieldKey}`);
+
+  const accepted = await askConfirm({
+    title: `应用字段建议：${fieldKey}`,
+    text: `建议值：${suggestedValue || "(空)"}`,
+    confirmText: "应用",
+    cancelText: "跳过",
+    type: "success",
+  });
+  if (!accepted) return false;
+
+  input.value = suggestedValue || "";
+  return true;
+}
+
+async function runBatchAnalyzeSelected(messageEl) {
+  const ids = [...state.selectedIds];
+  if (ids.length === 0) throw new Error("请先在记录中心勾选记录");
+  if (!state.settings.ai?.enabled) throw new Error("请先到设置页启用 AI");
+
+  const accepted = await askConfirm({
+    title: "确认批量 AI 分析",
+    text: `即将对 ${ids.length} 条记录发送全文进行分析，完成后你可逐条确认是否写回。`,
+    confirmText: "开始分析",
+    cancelText: "取消",
+  });
+  if (!accepted) throw new Error("已取消批量分析");
+
+  if (state.settings.ai?.requirePdf) {
+    const missingPdfIds = ids.filter((id) => {
+      const paper = getPaperById(id);
+      return !paper?.pdfPath;
+    });
+    if (missingPdfIds.length > 0) {
+      throw new Error(`当前策略要求先绑定PDF。缺失PDF记录ID: ${missingPdfIds.join(", ")}`);
+    }
+  }
+
+  messageEl.textContent = "批量分析任务创建中...";
+  const targetFieldKeys = collectAiTargetFieldKeys();
+  const created = await api.batchAnalyze({
+    paperIds: ids,
+    targetFieldKeys,
+    mode: "combined",
+    pdfPolicy: state.settings.ai?.pdfPolicy || "full_pdf",
+    consent: { accepted: true },
+  });
+
+  const batchJobId = created.batchJobId;
+  if (!batchJobId) throw new Error("批量任务创建失败");
+
+  let retries = 0;
+  while (retries < 120) {
+    // eslint-disable-next-line no-await-in-loop
+    const job = await api.getAiJob(batchJobId);
+    const total = Number(job?.result?.total || ids.length);
+    const done = Number(job?.result?.done || 0);
+    const failed = Number(job?.result?.failed || 0);
+    messageEl.textContent = `批量分析中：${done}/${total}，失败 ${failed}`;
+
+    if (["done", "partial", "failed"].includes(job.status)) {
+      const doneItems = (job.items || []).filter((item) => item.status === "done");
+      for (const item of doneItems) {
+        const paper = getPaperById(item.paperId);
+        const suggestedValues = item.result?.suggestedValues || {};
+        if (!paper || Object.keys(suggestedValues).length === 0) continue;
+
+        const applyAccepted = await askConfirm({
+          title: `应用建议到 #${paper.id}`,
+          text: `${paper.title || "未命名"}：是否应用本条 AI 建议？`,
+          confirmText: "应用",
+          cancelText: "跳过",
+          type: "success",
+        });
+        if (!applyAccepted) continue;
+
+        // eslint-disable-next-line no-await-in-loop
+        await api.updatePaper(paper.id, {
+          fieldValues: {
+            ...(paper.fieldValues || {}),
+            ...suggestedValues,
+          },
+          source: "ai_applied",
+        });
+      }
+
+      await refreshPapers();
+      messageEl.textContent = `批量分析完成：成功 ${doneItems.length} 条，失败 ${failed} 条`;
+      return;
+    }
+
+    retries += 1;
+    // eslint-disable-next-line no-await-in-loop
+    await new Promise((resolve) => setTimeout(resolve, 1200));
+  }
+
+  throw new Error("批量分析超时，请稍后在记录中心重试");
+}
+
 function setActiveTab(tabName) {
   app.tabEls.forEach((t) => t.classList.toggle("active", t.dataset.tab === tabName));
   ["home", "entry", "library", "settings"].forEach((name) => {
@@ -140,6 +373,7 @@ function collectEntryPayload() {
     templateId: state.currentTemplateId ? Number(state.currentTemplateId) : null,
     autoCreateMd: Boolean(state.autoCreateMd),
     fieldValues: {},
+    source: state.aiSession.id ? "ai_suggested" : "manual",
   };
 
   BASE_ENTRY_FIELDS.forEach(([key]) => {
@@ -161,6 +395,9 @@ function collectEntryPayload() {
 
 function fillEntryForm(paper) {
   if (!paper) return;
+  if (state.aiSession.id && Number(state.aiSession.paperId) !== Number(paper.id)) {
+    resetAiSessionLocal();
+  }
   state.currentStage = paper.stage || "rough";
   state.currentTemplateId = paper.templateId || state.currentTemplateId;
   renderEntry();
@@ -180,6 +417,7 @@ function fillEntryForm(paper) {
 function resetEntryAfterSave() {
   state.editingPaperId = null;
   state.autoCreateMd = true;
+  resetAiSessionLocal();
   renderEntry();
 }
 
@@ -200,14 +438,18 @@ function renderEntry() {
     .join("");
 
   const dynamicSurvey = (template?.fields || [])
-    .map(
-      (field) => `
+    .map((field) => {
+      const blocked = isAiBlockedField(field.key);
+      return `
       <div class="survey-item ${field.required ? "required" : ""}">
-        <label>${escapeHtml(field.label)}</label>
+        <div class="row-between" style="margin-bottom:6px;">
+          <label style="margin:0;">${escapeHtml(field.label)}</label>
+          <button class="btn small" data-ai-field="${escapeHtml(field.key)}" ${blocked ? "disabled" : ""}>${blocked ? "人工填写" : "AI生成"}</button>
+        </div>
         ${buildFieldInput(field, "")}
       </div>
-    `
-    )
+    `;
+    })
     .join("");
 
   app.entryEl.innerHTML = `
@@ -252,6 +494,7 @@ function renderEntry() {
         拖入 PDF 自动读取元数据（仅本地解析），或
         <input type="file" id="pdfInput" accept="application/pdf" />
       </div>
+      <div class="muted" style="margin-top:8px;">当前AI策略：${state.settings.ai?.requirePdf ? "必须先绑定PDF才允许生成" : "允许无PDF生成（仅基于元数据/笔记）"}</div>
       <div class="message" id="pdfMessage"></div>
     </div>
 
@@ -264,7 +507,8 @@ function renderEntry() {
       <div class="row" style="margin-top: 14px;">
         <button class="btn primary" id="savePaperBtn">保存记录</button>
         <button class="btn" id="clearEntryBtn">清空表单</button>
-        <button class="btn" id="mockAiBtn">调用AI建议（预留）</button>
+        <button class="btn" id="mockAiBtn">AI补全空字段</button>
+        <button class="btn" id="resetAiSessionBtn">重置AI会话</button>
       </div>
       <div class="message" id="entryMessage"></div>
     </div>
@@ -274,6 +518,7 @@ function renderEntry() {
     radio.onchange = () => {
       state.currentStage = radio.value;
       ensureTemplateSelected();
+      resetAiSessionLocal();
       renderEntry();
     };
   });
@@ -282,6 +527,7 @@ function renderEntry() {
   if (templateSelect) {
     templateSelect.onchange = () => {
       state.currentTemplateId = Number(templateSelect.value);
+      resetAiSessionLocal();
       renderEntry();
     };
   }
@@ -312,10 +558,16 @@ function renderEntry() {
     try {
       const payload = collectEntryPayload();
       if (!payload.title) throw new Error("论文题目必填");
+      if (state.settings.ai?.requirePdf && !payload.pdfPath) {
+        throw new Error("当前策略要求先上传PDF并保存路径后，才能进行AI生成");
+      }
+      let savedPaperId = null;
       if (state.editingPaperId) {
-        await api.updatePaper(state.editingPaperId, payload);
+        const updated = await api.updatePaper(state.editingPaperId, payload);
+        savedPaperId = updated?.id || state.editingPaperId;
       } else {
-        await api.createPaper(payload);
+        const created = await api.createPaper(payload);
+        savedPaperId = created?.id || null;
       }
       await refreshPapers();
       showModal({ title: "保存成功", text: "记录已保存，并已自动清空当前表单。" });
@@ -327,6 +579,7 @@ function renderEntry() {
 
   app.entryEl.querySelector("#clearEntryBtn").onclick = () => {
     state.editingPaperId = null;
+    resetAiSessionLocal();
     renderEntry();
   };
 
@@ -334,21 +587,92 @@ function renderEntry() {
   if (exitEditBtn) {
     exitEditBtn.onclick = () => {
       state.editingPaperId = null;
+      resetAiSessionLocal();
       renderEntry();
     };
   };
 
+  app.entryEl.querySelectorAll("[data-ai-field]").forEach((btn) => {
+    btn.onclick = async () => {
+      const fieldKey = btn.dataset.aiField;
+      try {
+        btn.disabled = true;
+        btn.textContent = "生成中...";
+        const result = await runFieldAiSuggest({ paperId: state.editingPaperId, fieldKey });
+        const suggestedValue = result.suggestedValues?.[fieldKey] || "";
+        if (!suggestedValue) throw new Error("当前字段未返回可用建议");
+        const applied = await applyFieldSuggestionWithConfirm({ fieldKey, suggestedValue });
+        if (!applied) {
+          showModal({ title: "已跳过", text: "你已选择不应用该字段建议。", type: "primary" });
+          return;
+        }
+        const contextText = result?.contextMeta
+          ? `上下文：PDF文件=${result.contextMeta.hasPdfFile ? "有" : "无"}，已用PDF全文=${result.contextMeta.usedPdfText ? "是" : "否"}，已用笔记=${result.contextMeta.usedNoteContent ? "是" : "否"}`
+          : "";
+        showModal({
+          title: "字段建议已应用",
+          text: `${normalizeAiSourceLabel(result)}，请手动保存后生效。${contextText ? `\n${contextText}` : ""}`,
+        });
+      } catch (error) {
+        showModal({ title: "AI建议失败", text: error.message, type: "error" });
+      } finally {
+        btn.disabled = false;
+        btn.textContent = "AI生成";
+      }
+    };
+  });
+
   app.entryEl.querySelector("#mockAiBtn").onclick = async () => {
     try {
       if (!state.editingPaperId) throw new Error("请先保存记录后再调用AI建议");
-      const result = await api.aiSuggest(state.editingPaperId);
+      const paper = getPaperById(Number(state.editingPaperId));
+      if (state.settings.ai?.requirePdf && !paper?.pdfPath) {
+        throw new Error("当前策略要求先上传/绑定PDF，才能执行AI补全");
+      }
+      const targetFieldKeys = collectAiTargetFieldKeys();
+      if (targetFieldKeys.length === 0) throw new Error("当前模板没有可分析字段（可能已被设为人工填写）");
+      const consentAccepted = await ensureAiFullPdfConsentIfNeeded(state.editingPaperId);
+      if (!consentAccepted) throw new Error("已取消 AI 分析");
+      const result = await api.aiSuggest({
+        paperId: state.editingPaperId,
+        targetFieldKeys,
+        mode: "combined",
+        pdfPolicy: state.settings.ai?.pdfPolicy || "full_pdf",
+        consent: { accepted: true },
+        aiSessionId:
+          state.aiSession.id && Number(state.aiSession.paperId) === Number(state.editingPaperId)
+            ? state.aiSession.id
+            : "",
+      });
+      if (result?.aiSessionId) {
+        state.aiSession = { id: result.aiSessionId, paperId: Number(state.editingPaperId), updatedAt: Date.now() };
+      }
+      let changed = 0;
       Object.entries(result.suggestedValues || {}).forEach(([key, value]) => {
         const input = app.entryEl.querySelector(`[data-field-key="${key}"]`);
-        if (input && !input.value.trim()) input.value = value;
+        if (input && !input.value.trim()) {
+          input.value = value;
+          changed += 1;
+        }
       });
-      showModal({ title: "AI建议已填入", text: "建议值已写入表单，仍需你手动点击保存。" });
+      showModal({
+        title: "AI建议已填入",
+        text: changed > 0 ? `已填入 ${changed} 个空字段，仍需你手动点击保存。` : "没有可填入的空字段。",
+      });
     } catch (error) {
       showModal({ title: "AI建议失败", text: error.message, type: "error" });
+    }
+  };
+
+  app.entryEl.querySelector("#resetAiSessionBtn").onclick = async () => {
+    try {
+      if (state.aiSession.id) {
+        await api.resetAiSession(state.aiSession.id);
+      }
+      resetAiSessionLocal();
+      showModal({ title: "会话已重置", text: "下次 AI 生成将重新确认并建立上下文。", type: "primary" });
+    } catch (error) {
+      showModal({ title: "重置失败", text: error.message, type: "error" });
     }
   };
 }
@@ -368,13 +692,29 @@ function bindPdfParse() {
       const yearInput = app.entryEl.querySelector('[data-entry-key="year"]');
       const authorsInput = app.entryEl.querySelector('[data-entry-key="authors"]');
       const linkInput = app.entryEl.querySelector('[data-entry-key="link"]');
+      const pdfPathInput = app.entryEl.querySelector('[data-entry-key="pdfPath"]');
 
       if (titleInput && !titleInput.value.trim()) titleInput.value = meta.title || "";
       if (yearInput && !yearInput.value.trim()) yearInput.value = meta.year || "";
       if (authorsInput && !authorsInput.value.trim()) authorsInput.value = meta.authors || "";
       if (linkInput && !linkInput.value.trim() && meta.doi) linkInput.value = `https://doi.org/${meta.doi}`;
+      if (pdfPathInput && result?.pdfPath) pdfPathInput.value = result.pdfPath;
 
-      msgEl.textContent = `解析完成：${meta.title || "未识别标题"}`;
+      if (state.editingPaperId && result?.pdfPath) {
+        await api.updatePaper(state.editingPaperId, { pdfPath: result.pdfPath });
+        await refreshPapers();
+      }
+
+      if (state.aiSession.id) {
+        try {
+          await api.resetAiSession(state.aiSession.id);
+        } catch (_err) {
+          // ignore network reset errors and still clear local session
+        }
+      }
+      resetAiSessionLocal();
+
+      msgEl.textContent = `解析完成：${meta.title || "未识别标题"}（已绑定PDF路径，并重置AI会话）`;
     } catch (error) {
       msgEl.textContent = `解析失败：${error.message}`;
     }
@@ -695,6 +1035,7 @@ function renderLibrary() {
         <button class="btn" id="clearSelectBtn">清空选择</button>
         <button class="btn primary" id="exportSelectedBtn">导出所选</button>
         <button class="btn" id="exportAllBtn">导出筛选结果</button>
+        <button class="btn" id="aiBatchAnalyzeBtn">AI分析所选</button>
       </div>
       <div class="message" id="libraryMessage"></div>
     </div>
@@ -773,6 +1114,14 @@ function renderLibrary() {
 
   app.libraryEl.querySelector("#exportAllBtn").onclick = async () => {
     await exportByFilters(app.libraryEl.querySelector("#libraryMessage"));
+  };
+
+  app.libraryEl.querySelector("#aiBatchAnalyzeBtn").onclick = async () => {
+    try {
+      await runBatchAnalyzeSelected(app.libraryEl.querySelector("#libraryMessage"));
+    } catch (error) {
+      app.libraryEl.querySelector("#libraryMessage").textContent = `批量AI失败：${error.message}`;
+    }
   };
 
   app.libraryEl.querySelectorAll("[data-paper-select]").forEach((el) => {
@@ -927,6 +1276,62 @@ function renderSettings() {
     </div>
 
     <div class="card">
+      <div class="card-title">AI 设置（API Key / Base URL 走 .env）</div>
+      <div class="grid-3">
+        <div>
+          <label>启用AI</label>
+          <select id="aiEnabledSelect">
+            <option value="0" ${state.settings.ai?.enabled ? "" : "selected"}>关闭</option>
+            <option value="1" ${state.settings.ai?.enabled ? "selected" : ""}>开启</option>
+          </select>
+        </div>
+        <div>
+          <label>Provider</label>
+          <input id="aiProviderInput" value="${escapeHtml(state.settings.ai?.provider || "openai_compatible")}" />
+        </div>
+        <div>
+          <label>模型</label>
+          <input id="aiModelInput" value="${escapeHtml(state.settings.ai?.model || "gpt-4.1-mini")}" />
+        </div>
+        <div>
+          <label>超时（毫秒）</label>
+          <input id="aiTimeoutInput" value="${escapeHtml(String(state.settings.ai?.timeoutMs || 30000))}" />
+        </div>
+        <div>
+          <label>PDF策略</label>
+          <select id="aiPdfPolicySelect">
+            <option value="full_pdf" ${(state.settings.ai?.pdfPolicy || "full_pdf") === "full_pdf" ? "selected" : ""}>full_pdf</option>
+            <option value="metadata_only" ${(state.settings.ai?.pdfPolicy || "full_pdf") === "metadata_only" ? "selected" : ""}>metadata_only</option>
+          </select>
+        </div>
+        <div>
+          <label>无PDF禁止生成</label>
+          <select id="aiRequirePdfSelect">
+            <option value="1" ${state.settings.ai?.requirePdf === false ? "" : "selected"}>是</option>
+            <option value="0" ${state.settings.ai?.requirePdf === false ? "selected" : ""}>否</option>
+          </select>
+        </div>
+      </div>
+      <div style="margin-top:10px;">
+        <label>禁止自动补全字段（英文key，逗号分隔）</label>
+        <input id="aiBlockedFieldKeysInput" value="${escapeHtml((state.settings.ai?.blockedFieldKeys || []).join(", "))}" placeholder="relation_type, category" />
+      </div>
+      <div style="margin-top:10px;">
+        <label>系统提示词（可编辑）</label>
+        <textarea id="aiSystemPromptInput" style="min-height:120px;">${escapeHtml(state.settings.ai?.systemPrompt || DEFAULT_AI_SYSTEM_PROMPT)}</textarea>
+      </div>
+      <div style="margin-top:10px;">
+        <label>字段提示词模板（可编辑）</label>
+        <textarea id="aiFieldPromptTemplateInput" style="min-height:180px;">${escapeHtml(state.settings.ai?.fieldPromptTemplate || DEFAULT_AI_FIELD_PROMPT_TEMPLATE)}</textarea>
+      </div>
+      <div class="muted" style="margin-top:8px;">支持占位符：{{field_key}} {{mode}} {{paper_json}} {{note_content}} {{pdf_excerpt}}。Base URL 以 .env 的 AI_BASE_URL 为准。</div>
+      <div class="row" style="margin-top:10px;">
+        <button class="btn" id="resetAiPromptsBtn">恢复默认提示词</button>
+        <button class="btn primary" id="saveAiSettingsBtn">保存AI设置</button>
+      </div>
+    </div>
+
+    <div class="card">
       <div class="card-title">下拉选项管理</div>
       <div class="message">支持新增/编辑/删除，删除后不影响历史记录文本。</div>
     </div>
@@ -1049,6 +1454,43 @@ function renderSettings() {
       const notesDir = app.settingsEl.querySelector("#notesDirInput").value.trim();
       state.settings = await api.updateSettings({ notesDir });
       showModal({ title: "设置已保存", text: "MD 自动创建目录已更新。" });
+    } catch (error) {
+      showModal({ title: "保存失败", text: error.message, type: "error" });
+    }
+  };
+
+  app.settingsEl.querySelector("#resetAiPromptsBtn").onclick = () => {
+    const systemEl = app.settingsEl.querySelector("#aiSystemPromptInput");
+    const fieldEl = app.settingsEl.querySelector("#aiFieldPromptTemplateInput");
+    if (systemEl) systemEl.value = DEFAULT_AI_SYSTEM_PROMPT;
+    if (fieldEl) fieldEl.value = DEFAULT_AI_FIELD_PROMPT_TEMPLATE;
+  };
+
+  app.settingsEl.querySelector("#saveAiSettingsBtn").onclick = async () => {
+    try {
+      const blockedFieldKeys = app.settingsEl
+        .querySelector("#aiBlockedFieldKeysInput")
+        .value
+        .split(",")
+        .map((item) => item.trim())
+        .filter(Boolean);
+
+      const ai = {
+        enabled: app.settingsEl.querySelector("#aiEnabledSelect").value === "1",
+        provider: app.settingsEl.querySelector("#aiProviderInput").value.trim() || "openai_compatible",
+        model: app.settingsEl.querySelector("#aiModelInput").value.trim() || "gpt-4.1-mini",
+        timeoutMs: Number(app.settingsEl.querySelector("#aiTimeoutInput").value || 30000),
+        pdfPolicy: app.settingsEl.querySelector("#aiPdfPolicySelect").value || "full_pdf",
+        requirePdf: app.settingsEl.querySelector("#aiRequirePdfSelect").value === "1",
+        blockedFieldKeys,
+        systemPrompt: app.settingsEl.querySelector("#aiSystemPromptInput").value.trim() || DEFAULT_AI_SYSTEM_PROMPT,
+        fieldPromptTemplate:
+          app.settingsEl.querySelector("#aiFieldPromptTemplateInput").value.trim() || DEFAULT_AI_FIELD_PROMPT_TEMPLATE,
+      };
+      const notesDir = app.settingsEl.querySelector("#notesDirInput").value.trim();
+      state.settings = await api.updateSettings({ notesDir, ai });
+      showModal({ title: "AI设置已保存", text: "AI 配置已更新。提示词与约束策略已生效。" });
+      renderEntry();
     } catch (error) {
       showModal({ title: "保存失败", text: error.message, type: "error" });
     }

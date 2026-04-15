@@ -65,4 +65,12 @@ async function parsePdfMetadata(buffer) {
   };
 }
 
-module.exports = { parsePdfMetadata };
+async function parsePdfFullText(buffer) {
+  const parsed = await pdfParse(buffer);
+  return {
+    text: (parsed.text || "").replace(/\t/g, " "),
+    pages: Number(parsed.numpages || 0),
+  };
+}
+
+module.exports = { parsePdfMetadata, parsePdfFullText };

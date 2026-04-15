@@ -90,10 +90,23 @@ export const api = {
       body: JSON.stringify({ mdPath, title: paperMeta.title || "", year: paperMeta.year || "" }),
     });
   },
-  aiSuggest(paperId) {
+  aiSuggest(body) {
+    const payload =
+      typeof body === "number"
+        ? { paperId: body, targetFieldKeys: ["main_contribution", "limitation"], mode: "combined" }
+        : body;
     return request("/api/ai/analyze-and-fill", {
       method: "POST",
-      body: JSON.stringify({ paperId }),
+      body: JSON.stringify(payload),
     });
+  },
+  batchAnalyze(body) {
+    return request("/api/ai/batch/analyze", { method: "POST", body: JSON.stringify(body) });
+  },
+  getAiJob(id) {
+    return request(`/api/ai/jobs/${id}`);
+  },
+  resetAiSession(aiSessionId) {
+    return request("/api/ai/session/reset", { method: "POST", body: JSON.stringify({ aiSessionId }) });
   },
 };

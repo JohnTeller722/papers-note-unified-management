@@ -18,6 +18,22 @@ if (!fs.existsSync(DB_DIR)) {
 
 const db = new DatabaseSync(DB_PATH);
 
+const DEFAULT_AI_SYSTEM_PROMPT =
+  "你是严谨的论文阅读助手。只基于提供的论文信息作答，证据不足时返回空值，不要编造。输出必须是 JSON 对象。";
+
+const DEFAULT_AI_FIELD_PROMPT_TEMPLATE = [
+  "请基于以下上下文，为目标字段生成建议值。",
+  "目标字段: {{field_key}}",
+  "分析模式: {{mode}}",
+  "论文元数据(JSON): {{paper_json}}",
+  "笔记摘录: {{note_content}}",
+  "PDF全文摘录: {{pdf_excerpt}}",
+  "若证据不足，请返回空字符串。",
+  "仅返回 JSON: {\"value\":\"\",\"confidence\":0.0,\"rationale\":\"\"}",
+].join("\n");
+
+const DEFAULT_AI_BLOCKED_FIELD_KEYS = ["relation_type", "category"];
+
 db.exec("PRAGMA foreign_keys = ON");
 
 function run(sql, params = []) {
@@ -218,6 +234,21 @@ async function initSchema() {
   `);
 
   await run(`
+    CREATE TABLE IF NOT EXISTS ai_job_items (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      job_id INTEGER NOT NULL,
+      paper_id INTEGER,
+      status TEXT NOT NULL,
+      result_json TEXT,
+      error_json TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      FOREIGN KEY(job_id) REFERENCES ai_jobs(id) ON DELETE CASCADE,
+      FOREIGN KEY(paper_id) REFERENCES papers(id) ON DELETE SET NULL
+    )
+  `);
+
+  await run(`
     CREATE TABLE IF NOT EXISTS app_settings (
       id INTEGER PRIMARY KEY CHECK (id = 1),
       notes_dir TEXT,
@@ -232,7 +263,48 @@ async function initSchema() {
   if (!hasTemplateId) {
     await run("ALTER TABLE papers ADD COLUMN template_id INTEGER");
   }
+
+  async function ensureColumn(tableName, columnName, definitionSql) {
+    const cols = await all(`PRAGMA table_info(${tableName})`);
+    const exists = cols.some((col) => col.name === columnName);
+    if (!exists) {
+      await run(`ALTER TABLE ${tableName} ADD COLUMN ${definitionSql}`);
+    }
+  }
+
+  await ensureColumn("app_settings", "ai_enabled", "ai_enabled INTEGER NOT NULL DEFAULT 0");
+  await ensureColumn("app_settings", "ai_provider", "ai_provider TEXT NOT NULL DEFAULT 'openai_compatible'");
+  await ensureColumn("app_settings", "ai_base_url", "ai_base_url TEXT NOT NULL DEFAULT 'https://api.openai.com/v1'");
+  await ensureColumn("app_settings", "ai_model", "ai_model TEXT NOT NULL DEFAULT 'gpt-4.1-mini'");
+  await ensureColumn("app_settings", "ai_timeout_ms", "ai_timeout_ms INTEGER NOT NULL DEFAULT 30000");
+  await ensureColumn("app_settings", "ai_pdf_policy", "ai_pdf_policy TEXT NOT NULL DEFAULT 'full_pdf'");
+  await ensureColumn(
+    "app_settings",
+    "ai_system_prompt",
+    `ai_system_prompt TEXT NOT NULL DEFAULT '${DEFAULT_AI_SYSTEM_PROMPT.replace(/'/g, "''")}'`
+  );
+  await ensureColumn(
+    "app_settings",
+    "ai_field_prompt_template",
+    `ai_field_prompt_template TEXT NOT NULL DEFAULT '${DEFAULT_AI_FIELD_PROMPT_TEMPLATE.replace(/'/g, "''")}'`
+  );
+  await ensureColumn(
+    "app_settings",
+    "ai_blocked_field_keys_json",
+    `ai_blocked_field_keys_json TEXT NOT NULL DEFAULT '${JSON.stringify(DEFAULT_AI_BLOCKED_FIELD_KEYS).replace(/'/g, "''")}'`
+  );
+  await ensureColumn("app_settings", "ai_require_pdf", "ai_require_pdf INTEGER NOT NULL DEFAULT 1");
+
+  await ensureColumn("ai_jobs", "job_scope", "job_scope TEXT NOT NULL DEFAULT 'single'");
+  await ensureColumn("ai_jobs", "mode", "mode TEXT");
+  await ensureColumn("ai_jobs", "target_field_keys_json", "target_field_keys_json TEXT");
+  await ensureColumn("ai_jobs", "started_at", "started_at TEXT");
+  await ensureColumn("ai_jobs", "finished_at", "finished_at TEXT");
+  await ensureColumn("ai_jobs", "error_json", "error_json TEXT");
+  await ensureColumn("ai_jobs", "session_id", "session_id TEXT");
+  await ensureColumn("ai_jobs", "warnings_json", "warnings_json TEXT");
 }
+
 
 function slugify(input) {
   return String(input || "")
@@ -442,9 +514,31 @@ async function deleteTemplate(templateId) {
 
 async function getAppSettings() {
   const row = await get("SELECT * FROM app_settings WHERE id = 1");
+  let blockedFieldKeys = [];
+  try {
+    const parsed = JSON.parse(row?.ai_blocked_field_keys_json || JSON.stringify(DEFAULT_AI_BLOCKED_FIELD_KEYS));
+    if (Array.isArray(parsed)) {
+      blockedFieldKeys = parsed.map((item) => String(item || "").trim()).filter(Boolean);
+    }
+  } catch (_err) {
+    blockedFieldKeys = [...DEFAULT_AI_BLOCKED_FIELD_KEYS];
+  }
+
   return {
     id: 1,
     notesDir: row?.notes_dir || "",
+    ai: {
+      enabled: Boolean(row?.ai_enabled),
+      provider: row?.ai_provider || "openai_compatible",
+      baseUrl: row?.ai_base_url || "https://api.openai.com/v1",
+      model: row?.ai_model || "gpt-4.1-mini",
+      timeoutMs: Number(row?.ai_timeout_ms || 30000),
+      pdfPolicy: row?.ai_pdf_policy || "full_pdf",
+      systemPrompt: row?.ai_system_prompt || DEFAULT_AI_SYSTEM_PROMPT,
+      fieldPromptTemplate: row?.ai_field_prompt_template || DEFAULT_AI_FIELD_PROMPT_TEMPLATE,
+      blockedFieldKeys,
+      requirePdf: row?.ai_require_pdf === undefined ? true : Boolean(row?.ai_require_pdf),
+    },
     updatedAt: row?.updated_at || now(),
   };
 }
@@ -452,7 +546,55 @@ async function getAppSettings() {
 async function updateAppSettings(payload = {}) {
   const current = await getAppSettings();
   const notesDir = payload.notesDir === undefined ? current.notesDir : String(payload.notesDir || "").trim();
-  await run("UPDATE app_settings SET notes_dir = ?, updated_at = ? WHERE id = 1", [notesDir, now()]);
+  const nextAi = {
+    enabled:
+      payload.ai?.enabled === undefined
+        ? current.ai.enabled
+        : Boolean(payload.ai.enabled),
+    provider: payload.ai?.provider ? String(payload.ai.provider).trim() : current.ai.provider,
+    baseUrl: payload.ai?.baseUrl ? String(payload.ai.baseUrl).trim() : current.ai.baseUrl,
+    model: payload.ai?.model ? String(payload.ai.model).trim() : current.ai.model,
+    timeoutMs:
+      payload.ai?.timeoutMs === undefined
+        ? current.ai.timeoutMs
+        : Math.max(3000, Number(payload.ai.timeoutMs) || current.ai.timeoutMs),
+    pdfPolicy: payload.ai?.pdfPolicy ? String(payload.ai.pdfPolicy).trim() : current.ai.pdfPolicy,
+    systemPrompt:
+      payload.ai?.systemPrompt === undefined
+        ? current.ai.systemPrompt
+        : String(payload.ai.systemPrompt || "").trim() || DEFAULT_AI_SYSTEM_PROMPT,
+    fieldPromptTemplate:
+      payload.ai?.fieldPromptTemplate === undefined
+        ? current.ai.fieldPromptTemplate
+        : String(payload.ai.fieldPromptTemplate || "").trim() || DEFAULT_AI_FIELD_PROMPT_TEMPLATE,
+    blockedFieldKeys:
+      payload.ai?.blockedFieldKeys === undefined
+        ? current.ai.blockedFieldKeys
+        : Array.isArray(payload.ai.blockedFieldKeys)
+          ? payload.ai.blockedFieldKeys.map((item) => String(item || "").trim()).filter(Boolean)
+          : current.ai.blockedFieldKeys,
+    requirePdf:
+      payload.ai?.requirePdf === undefined
+        ? current.ai.requirePdf
+        : Boolean(payload.ai.requirePdf),
+  };
+  await run(
+    "UPDATE app_settings SET notes_dir = ?, ai_enabled = ?, ai_provider = ?, ai_base_url = ?, ai_model = ?, ai_timeout_ms = ?, ai_pdf_policy = ?, ai_system_prompt = ?, ai_field_prompt_template = ?, ai_blocked_field_keys_json = ?, ai_require_pdf = ?, updated_at = ? WHERE id = 1",
+    [
+      notesDir,
+      Number(nextAi.enabled),
+      nextAi.provider || "openai_compatible",
+      nextAi.baseUrl || "https://api.openai.com/v1",
+      nextAi.model || "gpt-4.1-mini",
+      nextAi.timeoutMs,
+      nextAi.pdfPolicy || "full_pdf",
+      nextAi.systemPrompt,
+      nextAi.fieldPromptTemplate,
+      JSON.stringify(nextAi.blockedFieldKeys || DEFAULT_AI_BLOCKED_FIELD_KEYS),
+      Number(Boolean(nextAi.requirePdf)),
+      now(),
+    ]
+  );
   return getAppSettings();
 }
 

@@ -3,6 +3,8 @@ node_modules/
 .github/
 backend/data/litnotes.db
 backend/data/exports/
+backend/data/pdfs/
 notes/
 .DS_Store
 Thumbs.db
+.env
