@@ -33,6 +33,7 @@ const state = {
 };
 
 const app = {
+  homeEl: document.getElementById("home"),
   entryEl: document.getElementById("entry"),
   libraryEl: document.getElementById("library"),
   settingsEl: document.getElementById("settings"),
@@ -115,7 +116,7 @@ function buildFieldInput(field, value = "") {
 
 function setActiveTab(tabName) {
   app.tabEls.forEach((t) => t.classList.toggle("active", t.dataset.tab === tabName));
-  ["entry", "library", "settings"].forEach((name) => {
+  ["home", "entry", "library", "settings"].forEach((name) => {
     document.getElementById(name).classList.toggle("active", name === tabName);
   });
 }
@@ -125,6 +126,7 @@ function renderTabs() {
     tab.onclick = () => {
       const selected = tab.dataset.tab;
       setActiveTab(selected);
+      if (selected === "home") renderHome();
       if (selected === "entry") renderEntry();
       if (selected === "library") renderLibrary();
       if (selected === "settings") renderSettings();
@@ -405,6 +407,235 @@ function getPaperById(id) {
   return state.papers.find((paper) => paper.id === id);
 }
 
+function formatDateTime(isoText) {
+  if (!isoText) return "";
+  const date = new Date(isoText);
+  if (Number.isNaN(date.getTime())) return isoText;
+  return date.toLocaleString("zh-CN", { hour12: false });
+}
+
+function paperPriority(paper) {
+  return paper.priority || paper.fieldValues?.priority || paper.fieldValues?.worth_deep_read || "";
+}
+
+function getRecentPapers(limit = 5) {
+  return state.papers.slice(0, limit);
+}
+
+function getDeepCandidates(limit = 5) {
+  const highPriority = ["A 必读", "B 可读"];
+  return state.papers
+    .filter((paper) => paper.stage === "rough")
+    .filter((paper) => {
+      const priority = paperPriority(paper);
+      if (!priority) return false;
+      return highPriority.some((token) => priority.includes(token));
+    })
+    .slice(0, limit);
+}
+
+function jumpToEditPaper(id) {
+  const paper = getPaperById(id);
+  if (!paper) return;
+  state.editingPaperId = id;
+  setActiveTab("entry");
+  fillEntryForm(paper);
+}
+
+async function exportByIds(ids, messageEl) {
+  const targetEl = messageEl || null;
+  try {
+    if (!Array.isArray(ids) || ids.length === 0) throw new Error("暂无可导出的记录");
+    const result = await api.exportPapers({ selectedIds: ids, viewMode: "deep" });
+    window.open(result.downloadUrl, "_blank");
+    if (targetEl) targetEl.textContent = "导出成功";
+  } catch (error) {
+    if (targetEl) targetEl.textContent = `导出失败：${error.message}`;
+    else throw error;
+  }
+}
+
+async function exportByFilters(messageEl) {
+  const targetEl = messageEl || null;
+  try {
+    const result = await api.exportPapers({ selectedIds: [], viewMode: "deep", filters: state.filters });
+    window.open(result.downloadUrl, "_blank");
+    if (targetEl) targetEl.textContent = "导出成功";
+  } catch (error) {
+    if (targetEl) targetEl.textContent = `导出失败：${error.message}`;
+    else throw error;
+  }
+}
+
+function renderHome() {
+  const recentPapers = getRecentPapers(5);
+  const candidatePapers = getDeepCandidates(5);
+  const totalCount = state.papers.length;
+  const deepCount = state.papers.filter((paper) => paper.stage === "deep").length;
+  const roughCount = totalCount - deepCount;
+  const gaugeMax = Math.max(20, Math.ceil(totalCount / 10) * 10);
+  const gaugePercent = Math.max(0, Math.min(100, Math.round((totalCount / gaugeMax) * 100)));
+  const gaugeDeg = Math.round((gaugePercent / 100) * 180 - 90);
+
+  app.homeEl.innerHTML = `
+    <div class="card dashboard-card gauge-card">
+      <div class="row-between">
+        <div>
+          <div class="card-title">论文数量仪表盘</div>
+          <div class="muted">总量进度（参考上限 ${gaugeMax}）</div>
+        </div>
+        <span class="badge">总计 ${totalCount} 篇</span>
+      </div>
+
+      <div class="gauge-wrap">
+        <div class="gauge" style="--gauge-progress:${gaugePercent}; --gauge-needle-deg:${gaugeDeg}deg;">
+          <div class="gauge-center">
+            <div class="gauge-value">${totalCount}</div>
+            <div class="muted">Papers</div>
+          </div>
+          <div class="gauge-needle"></div>
+        </div>
+
+        <div class="gauge-stats">
+          <div class="gauge-stat">
+            <div class="muted">粗读</div>
+            <strong>${roughCount}</strong>
+          </div>
+          <div class="gauge-stat">
+            <div class="muted">精读</div>
+            <strong>${deepCount}</strong>
+          </div>
+          <div class="gauge-stat">
+            <div class="muted">候选率</div>
+            <strong>${totalCount === 0 ? "0%" : `${Math.round((candidatePapers.length / totalCount) * 100)}%`}</strong>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="dashboard-grid">
+      <div class="card dashboard-card">
+        <div class="row-between">
+          <div>
+            <div class="card-title">最近阅读</div>
+            <div class="muted">按最近更新时间展示前 5 条</div>
+          </div>
+          <button class="btn small" id="homeToLibraryRecentBtn">查看全部</button>
+        </div>
+
+        <div class="dashboard-list" style="margin-top:10px;">
+          ${
+            recentPapers.length === 0
+              ? `<div class="muted">暂无记录</div>`
+              : recentPapers
+                  .map(
+                    (paper) => `
+                    <div class="dashboard-item">
+                      <div>
+                        <div class="dashboard-item-title">${escapeHtml(paper.title || "未命名")}</div>
+                        <div class="muted">${paper.stage === "deep" ? "精读" : "粗读"} · ${escapeHtml(paperPriority(paper)) || "无优先级"} · ${escapeHtml(formatDateTime(paper.updatedAt))}</div>
+                      </div>
+                      <button class="btn small" data-home-action="edit" data-id="${paper.id}">编辑</button>
+                    </div>
+                  `
+                  )
+                  .join("")
+          }
+        </div>
+      </div>
+
+      <div class="card dashboard-card">
+        <div class="row-between">
+          <div>
+            <div class="card-title">精读候选</div>
+            <div class="muted">粗读阶段且优先级为 A/B 的记录</div>
+          </div>
+          <button class="btn small" id="homeToLibraryCandidateBtn">查看全部</button>
+        </div>
+
+        <div class="dashboard-list" style="margin-top:10px;">
+          ${
+            candidatePapers.length === 0
+              ? `<div class="muted">暂无候选记录</div>`
+              : candidatePapers
+                  .map(
+                    (paper) => `
+                    <div class="dashboard-item">
+                      <div>
+                        <div class="dashboard-item-title">${escapeHtml(paper.title || "未命名")}</div>
+                        <div class="muted">${escapeHtml(paperPriority(paper)) || "无优先级"} · ${escapeHtml(paper.relationType || paper.fieldValues?.relation_type || "未设置关系")}</div>
+                      </div>
+                      <div class="row">
+                        <button class="btn small" data-home-action="edit" data-id="${paper.id}">编辑</button>
+                        <button class="btn small success" data-home-action="upgrade" data-id="${paper.id}">升级精读</button>
+                      </div>
+                    </div>
+                  `
+                  )
+                  .join("")
+          }
+        </div>
+      </div>
+    </div>
+
+    <div class="card dashboard-card">
+      <div class="card-title">导出快捷入口</div>
+      <div class="muted">一键导出最近阅读、精读候选或当前筛选结果</div>
+      <div class="row" style="margin-top:12px;">
+        <button class="btn primary" id="exportRecentBtn">导出最近阅读</button>
+        <button class="btn" id="exportCandidatesBtn">导出精读候选</button>
+        <button class="btn" id="exportFilteredBtn">导出当前筛选结果</button>
+      </div>
+      <div class="message" id="homeExportMessage"></div>
+    </div>
+  `;
+
+  app.homeEl.querySelector("#homeToLibraryRecentBtn").onclick = () => {
+    setActiveTab("library");
+    renderLibrary();
+  };
+
+  app.homeEl.querySelector("#homeToLibraryCandidateBtn").onclick = () => {
+    setActiveTab("library");
+    renderLibrary();
+  };
+
+  app.homeEl.querySelectorAll('[data-home-action="edit"]').forEach((btn) => {
+    btn.onclick = () => {
+      const id = Number(btn.dataset.id);
+      jumpToEditPaper(id);
+    };
+  });
+
+  app.homeEl.querySelectorAll('[data-home-action="upgrade"]').forEach((btn) => {
+    btn.onclick = async () => {
+      const id = Number(btn.dataset.id);
+      try {
+        const updated = await api.upgradePaper(id);
+        if (updated?.templateId) state.currentTemplateId = updated.templateId;
+        await refreshPapers();
+        renderHome();
+      } catch (error) {
+        showModal({ title: "升级失败", text: error.message, type: "error" });
+      }
+    };
+  });
+
+  const homeMessageEl = app.homeEl.querySelector("#homeExportMessage");
+
+  app.homeEl.querySelector("#exportRecentBtn").onclick = async () => {
+    await exportByIds(recentPapers.map((paper) => paper.id), homeMessageEl);
+  };
+
+  app.homeEl.querySelector("#exportCandidatesBtn").onclick = async () => {
+    await exportByIds(candidatePapers.map((paper) => paper.id), homeMessageEl);
+  };
+
+  app.homeEl.querySelector("#exportFilteredBtn").onclick = async () => {
+    await exportByFilters(homeMessageEl);
+  };
+}
+
 async function refreshPapers() {
   const list = await api.listPapers(state.filters);
   state.papers = list.items || [];
@@ -537,25 +768,11 @@ function renderLibrary() {
   };
 
   app.libraryEl.querySelector("#exportSelectedBtn").onclick = async () => {
-    try {
-      const ids = [...state.selectedIds];
-      if (ids.length === 0) throw new Error("请先选择记录");
-      const result = await api.exportPapers({ selectedIds: ids, viewMode: "deep" });
-      window.open(result.downloadUrl, "_blank");
-      app.libraryEl.querySelector("#libraryMessage").textContent = "导出成功";
-    } catch (error) {
-      app.libraryEl.querySelector("#libraryMessage").textContent = `导出失败：${error.message}`;
-    }
+    await exportByIds([...state.selectedIds], app.libraryEl.querySelector("#libraryMessage"));
   };
 
   app.libraryEl.querySelector("#exportAllBtn").onclick = async () => {
-    try {
-      const result = await api.exportPapers({ selectedIds: [], viewMode: "deep", filters: state.filters });
-      window.open(result.downloadUrl, "_blank");
-      app.libraryEl.querySelector("#libraryMessage").textContent = "导出成功";
-    } catch (error) {
-      app.libraryEl.querySelector("#libraryMessage").textContent = `导出失败：${error.message}`;
-    }
+    await exportByFilters(app.libraryEl.querySelector("#libraryMessage"));
   };
 
   app.libraryEl.querySelectorAll("[data-paper-select]").forEach((el) => {
@@ -572,11 +789,7 @@ function renderLibrary() {
       const action = btn.dataset.action;
 
       if (action === "edit") {
-        const paper = getPaperById(id);
-        if (!paper) return;
-        state.editingPaperId = id;
-        setActiveTab("entry");
-        fillEntryForm(paper);
+        jumpToEditPaper(id);
         return;
       }
 
@@ -913,8 +1126,8 @@ async function bootstrap() {
   await refreshSettings();
   await refreshPapers();
 
-  setActiveTab("entry");
-  renderEntry();
+  setActiveTab("home");
+  renderHome();
 }
 
 bootstrap().catch((error) => {

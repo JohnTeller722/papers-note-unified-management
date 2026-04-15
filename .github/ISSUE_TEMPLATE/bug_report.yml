@@ -1,0 +1,83 @@
+name: Bug 报告
+description: 报告一个可复现的问题
+title: "[Bug] "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢反馈问题。请尽量完整填写，方便快速定位。
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: 问题概述
+      description: 一句话描述出现了什么问题。
+      placeholder: 例如：夜间模式下下拉框文字不可见。
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: 复现步骤
+      description: 请按步骤描述，最好能 100% 复现。
+      placeholder: |
+        1. 打开页面
+        2. 切换到夜间模式
+        3. 进入录入页点击某个下拉框
+        4. 看到 ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: 期望结果
+      placeholder: 例如：下拉项应为深色背景且文字清晰可读。
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: 实际结果
+      placeholder: 例如：下拉项是白底，文字对比度不足。
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: 版本/提交号（可选）
+      description: 例如 main 分支最新提交 SHA。
+      placeholder: d3abab4
+
+  - type: dropdown
+    id: platform
+    attributes:
+      label: 运行平台
+      options:
+        - Windows
+        - macOS
+        - Linux
+        - 其他
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: 日志/截图（可选）
+      description: 粘贴报错信息或上传截图可显著加快定位。
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: 提交前确认
+      options:
+        - label: 我已搜索过现有 Issue，确认不是重复问题
+          required: true
+        - label: 我能稳定复现该问题并提供了复现步骤
+          required: true

@@ -1,0 +1,69 @@
+name: 功能请求
+description: 提交新功能或改进建议
+title: "[Feature] "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        欢迎提出功能建议。请尽量描述清楚业务场景与收益。
+
+  - type: textarea
+    id: background
+    attributes:
+      label: 背景与痛点
+      description: 当前遇到了什么问题？
+      placeholder: 例如：多套模板切换时，缺少字段排序能力，维护成本高。
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 建议方案
+      description: 你希望系统怎么做？
+      placeholder: 例如：在模板设计器中支持拖拽排序并保存 order_no。
+    validations:
+      required: true
+
+  - type: textarea
+    id: benefit
+    attributes:
+      label: 预期收益
+      description: 这个功能带来的价值是什么？
+      placeholder: 例如：提升模板维护效率，减少重复编辑。
+    validations:
+      required: true
+
+  - type: textarea
+    id: scope
+    attributes:
+      label: 影响范围（可选）
+      description: 你认为会影响哪些模块？
+      placeholder: |
+        - 前端：frontend/src/main.js
+        - 后端：backend/src/server.js
+        - 数据层：backend/src/db.js
+
+  - type: dropdown
+    id: priority
+    attributes:
+      label: 期望优先级
+      options:
+        - P0（非常紧急）
+        - P1（高）
+        - P2（中）
+        - P3（低）
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: 提交前确认
+      options:
+        - label: 我已搜索过现有 Issue，确认不是重复建议
+          required: true
+        - label: 我已描述清楚场景、方案和收益
+          required: true

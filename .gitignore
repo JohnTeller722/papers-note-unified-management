@@ -1,8 +1,8 @@
 node_modules/
 .claude/
+.github/
 backend/data/litnotes.db
 backend/data/exports/
 notes/
 .DS_Store
 Thumbs.db
-docs/
