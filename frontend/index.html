@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>文献阅读管理工具</title>
+    <link rel="stylesheet" href="/src/styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <div>
+          <div class="brand">文献阅读管理工具</div>
+          <div class="muted" style="margin-top:4px;">本地科研笔记系统</div>
+        </div>
+
+        <nav class="tabs side-tabs">
+          <button class="tab active" data-tab="entry">录入页</button>
+          <button class="tab" data-tab="library">记录中心</button>
+          <button class="tab" data-tab="settings">设置</button>
+        </nav>
+
+        <div style="margin-top:auto;">
+          <button id="themeToggle" class="btn small" style="width:100%;">切换日/夜</button>
+        </div>
+      </aside>
+
+      <main class="main-content">
+        <div class="container">
+          <section id="entry" class="panel active"></section>
+          <section id="library" class="panel"></section>
+          <section id="settings" class="panel"></section>
+        </div>
+      </main>
+    </div>
+
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>

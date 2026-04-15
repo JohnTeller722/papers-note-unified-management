@@ -1,0 +1,7 @@
+node_modules/
+.claude/
+backend/data/litnotes.db
+backend/data/exports/
+notes/
+.DS_Store
+Thumbs.db
